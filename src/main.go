@@ -19,12 +19,16 @@ const (
 )
 
 func main() {
-	buf := new(bytes.Buffer)
+
 	messageId, err := genId()
 	if err != nil {
 		fmt.Printf("Error generating message id:", err)
 	}
-	writeHeader(buf, messageId, Ping, 100, 0, []byte{})
+
+	b, err := buildMessage(messageId, Ping, 100, 0, []byte{})
+	if err != nil {
+		return
+	}
 
 	conn, err := net.Dial("tcp", "128.208.2.88:5002")
 	if err != nil {
@@ -32,7 +36,6 @@ func main() {
 		return
 	}
 
-	b := buf.Bytes()
 	n, err := conn.Write(b)
 	if n != len(b) || err != nil {
 		fmt.Printf("Err writing to conn: ", err)
@@ -59,13 +62,15 @@ func genId() (messageId []byte, err error) {
 	return
 }
 
-func writeHeader(
-	buf *bytes.Buffer,
+func buildMessage(
 	messageId []byte,
 	messageType MessageType,
 	ttl byte,
 	hops byte,
-	payload []byte) {
+	payload []byte) (b []byte, err error) {
+
+	b = nil
+	buf := new(bytes.Buffer)
 
 	n, err := buf.Write(messageId)
 	if n != len(messageId) || err != nil {
@@ -104,4 +109,8 @@ func writeHeader(
 	}
 
 	fmt.Printf("% x\n", buf.Bytes())
+
+	b = buf.Bytes()
+
+	return
 }
