@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -36,11 +37,24 @@ func (t MessageType) String() string {
 
 const KNOWN_ADDRESS = "128.208.2.88:5002"
 const HOST = "128.208.1.137"
-const PORT int16 = 25610
-const SECRET_TEXT = "Ian Obermiller <itao@uw.edu>"
+const PORT = 25610
+const SECRET = "Ian Obermiller <itao@uw.edu>"
+const LOG_FILE = "log.txt"
+
+var host string
+var port int
+var secret string
+var knownAddress string
+var logFile string
 
 func main() {
-	connect(KNOWN_ADDRESS)
+	flag.StringVar(&host, "host", HOST, "external ip to send in pongs")
+	flag.IntVar(&port, "port", PORT, "external port to send in pongs")
+	flag.StringVar(&secret, "secret", SECRET, "secret text to send in replies")
+	flag.StringVar(&knownAddress, "seed", KNOWN_ADDRESS, "initial seed node to ping (format host:port)")
+	flag.StringVar(&logFile, "log", LOG_FILE, "log file to which secrets are written")
+
+	connect(knownAddress)
 	startListener()
 }
 
@@ -62,8 +76,8 @@ func ping(c net.Conn) {
 
 func pong(c net.Conn, pingMessageId []byte) {
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, PORT)
-	buf.Write(net.ParseIP(HOST).To4())
+	binary.Write(buf, binary.BigEndian, int16(port))
+	buf.Write(net.ParseIP(host).To4())
 	send(c, Pong, pingMessageId, buf.Bytes())
 }
 
@@ -72,7 +86,7 @@ func query(c net.Conn) {
 }
 
 func reply(c net.Conn, queryMessageId []byte) {
-	send(c, Query, queryMessageId, []byte(SECRET_TEXT))
+	send(c, Query, queryMessageId, []byte(secret))
 }
 
 func send(c net.Conn, t MessageType, messageId []byte, payload []byte) {
@@ -95,7 +109,7 @@ func sendRaw(c net.Conn, b []byte) {
 }
 
 func startListener() {
-	ln, err := net.Listen("tcp", fmt.Sprint(":", PORT))
+	ln, err := net.Listen("tcp", fmt.Sprint(":", port))
 	if err != nil {
 		fmt.Println("Listen error: ", err)
 	}
@@ -175,7 +189,7 @@ func processReply(c net.Conn, b []byte) {
 
 	log := fmt.Sprint("Address", c.RemoteAddr().String(), "sent secret text", string(secretTextBytes), "\n")
 	fmt.Print(log)
-	file, _ := os.OpenFile("log.txt", os.O_APPEND|os.O_CREATE, 0)
+	file, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE, 0666)
 	file.WriteString(log)
 	file.Sync()
 	file.Close()
