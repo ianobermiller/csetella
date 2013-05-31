@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 )
 
 type MessageType byte
@@ -33,13 +34,18 @@ func (t MessageType) String() string {
 	}
 }
 
+const KNOWN_ADDRESS = "128.208.2.88:5002"
 const HOST = "128.208.1.137"
 const PORT int16 = 25610
+const SECRET_TEXT = "Ian Obermiller <itao@uw.edu>"
 
 func main() {
-	host := "128.208.2.88:5002"
+	connect(KNOWN_ADDRESS)
+	startListener()
+}
 
-	conn, err := net.Dial("tcp", host)
+func connect(address string) {
+	conn, err := net.Dial("tcp", address)
 	if err != nil {
 		fmt.Println("Dial err:", err)
 		return
@@ -48,7 +54,6 @@ func main() {
 	go handleConnection(conn)
 
 	go ping(conn)
-	startListener()
 }
 
 func ping(c net.Conn) {
@@ -60,6 +65,14 @@ func pong(c net.Conn, pingMessageId []byte) {
 	binary.Write(buf, binary.BigEndian, PORT)
 	buf.Write(net.ParseIP(HOST).To4())
 	send(c, Pong, pingMessageId, buf.Bytes())
+}
+
+func query(c net.Conn) {
+	send(c, Query, genId(), []byte{})
+}
+
+func reply(c net.Conn, queryMessageId []byte) {
+	send(c, Query, queryMessageId, []byte(SECRET_TEXT))
 }
 
 func send(c net.Conn, t MessageType, messageId []byte, payload []byte) {
@@ -98,8 +111,8 @@ func startListener() {
 
 func handleConnection(c net.Conn) {
 	for {
-		buf := make([]byte, 2048)
-		n, err := c.Read(buf)
+		b := make([]byte, 2048)
+		n, err := c.Read(b)
 
 		if err != nil {
 			fmt.Println("Read err:", err)
@@ -109,14 +122,63 @@ func handleConnection(c net.Conn) {
 			continue
 		}
 
-		t := MessageType(buf[16])
-		fmt.Printf("RECV %s %s - % x\n", t, c.RemoteAddr(), buf[:n])
+		t := MessageType(b[16])
+		msgId := b[:16]
+		fmt.Printf("RECV %s %s - % x\n", t, c.RemoteAddr(), b[:n])
 
 		switch t {
 		case Ping:
-			go pong(c, buf[:16])
+			go pong(c, msgId)
+		case Query:
+			go reply(c, msgId)
+		case Pong:
+			go processPong(c, b)
+		case Reply:
+			go processReply(c, b)
 		}
 	}
+}
+
+func processPong(c net.Conn, b []byte) {
+	buf := bytes.NewBuffer(b[24:])
+	var port int16
+	err := binary.Read(buf, binary.BigEndian, &port)
+	if err != nil {
+		fmt.Println("Could not read port from Pong message: ", err)
+		return
+	}
+
+	ipBytes := make([]byte, 4)
+	n, err := buf.Read(ipBytes)
+	if n != 4 || err != nil {
+		fmt.Println("Could not read ip from Pong message: ", err)
+		return
+	}
+
+}
+
+func processReply(c net.Conn, b []byte) {
+	buf := bytes.NewBuffer(b[20:])
+	var size int32
+	err := binary.Read(buf, binary.BigEndian, &size)
+	if err != nil {
+		fmt.Println("Could not read size from Reply message: ", err)
+		return
+	}
+
+	secretTextBytes := make([]byte, size)
+	n, err := buf.Read(secretTextBytes)
+	if n != int(size) || err != nil {
+		fmt.Println("Could not read secret text from Reply message: ", err)
+		return
+	}
+
+	log := fmt.Sprint("Address", c.RemoteAddr().String(), "sent secret text", string(secretTextBytes), "\n")
+	fmt.Print(log)
+	file, _ := os.OpenFile("log.txt", os.O_APPEND|os.O_CREATE, 0)
+	file.WriteString(log)
+	file.Sync()
+	file.Close()
 }
 
 func genId() (messageId []byte) {
