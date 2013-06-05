@@ -1,0 +1,1 @@
+Cache class from https://github.com/pmylund/go-cache
