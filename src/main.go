@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	mrand "math/rand"
 	"net"
 	"os"
 	"time"
@@ -38,15 +37,11 @@ func (t MessageType) String() string {
 	}
 }
 
-type Conn struct {
-	conn      *net.Conn
-	gotSecret bool
-}
-
+const TIMER_INTERVAL = 200 * time.Second
 const KNOWN_ADDRESS = "128.208.2.88:5002"
 const HOST = "128.208.1.137"
-const PORT = 25610
-const SECRET = "Ian Obermiller -- iano [at] cs.washington.edu -- 25610"
+const PORT = 20202
+const SECRET = "Ian Obermiller -- iano [at] cs.washington.edu -- 47249046"
 const LOG_FILE = "log.txt"
 
 var host string
@@ -55,8 +50,8 @@ var secret string
 var knownAddress string
 var logFile string
 
-var peers = make([]string, 0)
-var connections = make(map[string]*Conn)
+var conn2peer = make(map[net.Conn]string)
+var peer2conn = make(map[string]net.Conn)
 var gotSecret = make(map[string]bool)
 var msgCache = cache.New(5*time.Minute, 30*time.Second)
 
@@ -78,32 +73,42 @@ func main() {
 
 	go startListener()
 
-	peers = append(peers, knownAddress)
+	go connect(knownAddress)
 
+	shouldPing := true
 	for {
-		// choose a random peer and try to connect to them
-		var err error
-		index := 0
-		if len(peers) > 0 {
-			index = mrand.Intn(len(peers))
-			if err != nil {
-				fmt.Println("Rand err:", err)
-				continue
-			}
-		}
-		peer := peers[index]
-		c, ok := connections[peer]
-		if ok {
-			if c.gotSecret {
-				go ping(*c.conn)
+		for c, _ := range conn2peer {
+			if shouldPing {
+				go ping(c)
 			} else {
-				go query(*c.conn)
+				go query(c)
 			}
-		} else {
-			connect(peer)
 		}
-		time.Sleep(2 * time.Second)
+
+		for p, c := range peer2conn {
+			if c == nil {
+				go connect(p)
+			}
+		}
+
+		shouldPing = !shouldPing
+		time.Sleep(TIMER_INTERVAL)
 	}
+}
+
+func tryAddPeer(ipBytes []byte, port uint16) {
+	peer := fmt.Sprintf("%v:%v", net.IP(ipBytes).String(), port)
+	tryAddPeerString(peer)
+}
+
+func tryAddPeerString(peer string) {
+	for p, _ := range peer2conn {
+		if p == peer {
+			return
+		}
+	}
+	fmt.Println("Adding new peer ", peer)
+	peer2conn[peer] = nil
 }
 
 func connect(address string) {
@@ -114,8 +119,25 @@ func connect(address string) {
 	}
 
 	go handleConnection(conn)
+}
 
-	go ping(conn)
+func startListener() {
+	ln, err := net.Listen("tcp", fmt.Sprint(":", port))
+	if err != nil {
+		fmt.Println("Listen error: ", err)
+	}
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			fmt.Println("Accept error: ", err)
+			continue
+		}
+
+		peer := conn.RemoteAddr().String()
+		fmt.Printf("Address %v connected to us!\n", peer)
+
+		go handleConnection(conn)
+	}
 }
 
 func ping(c net.Conn) {
@@ -156,24 +178,10 @@ func sendRaw(c net.Conn, b []byte) {
 	}
 }
 
-func startListener() {
-	ln, err := net.Listen("tcp", fmt.Sprint(":", port))
-	if err != nil {
-		fmt.Println("Listen error: ", err)
-	}
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			fmt.Println("Accept error: ", err)
-			continue
-		}
-		go handleConnection(conn)
-	}
-}
-
 func handleConnection(c net.Conn) {
-	addr := c.RemoteAddr().String()
-	connections[addr] = &Conn{&c, false}
+	peer := c.RemoteAddr().String()
+	conn2peer[c] = peer
+	// `peer` is not the external address, so don't add to peer2conn
 
 	b := make([]byte, 2048)
 	for {
@@ -181,7 +189,11 @@ func handleConnection(c net.Conn) {
 
 		if err != nil {
 			fmt.Println("Read err:", err)
-			delete(connections, addr)
+			peer = conn2peer[c]
+			if _, ok := peer2conn[peer]; ok {
+				peer2conn[peer] = nil
+			}
+			delete(conn2peer, c)
 			break
 		}
 
@@ -198,9 +210,15 @@ func getKey(msgId []byte, mt MessageType) string {
 }
 
 func processMessage(c net.Conn, b []byte) {
+	peer := c.RemoteAddr().String()
+	if len(b) < 23 {
+		fmt.Printf("RECV %s packet too small: % x", peer, b)
+		return
+	}
+
 	t := MessageType(b[16])
 	msgId := b[:16]
-	fmt.Printf("RECV %s %s - % x\n", t, c.RemoteAddr(), b)
+	fmt.Printf("RECV %s %s - % x\n", t, peer, b)
 
 	key := getKey(msgId, t)
 	if _, found := msgCache.Get(key); found {
@@ -212,8 +230,10 @@ func processMessage(c net.Conn, b []byte) {
 	switch t {
 	case Ping:
 		go pong(c, msgId)
+		forwardMessage(c, b)
 	case Query:
 		go reply(c, msgId)
+		forwardMessage(c, b)
 	case Pong:
 		go processPong(c, b)
 	case Reply:
@@ -221,8 +241,29 @@ func processMessage(c net.Conn, b []byte) {
 	}
 }
 
+func forwardMessage(originalConn net.Conn, b []byte) {
+	ttl := b[17]
+
+	if ttl <= 1 {
+		// don't forward
+		return
+	}
+
+	b[17] = ttl - 1   // decrement ttl
+	b[18] = b[18] + 1 // increment hops
+
+	// forward to all connected peers
+	for conn, _ := range conn2peer {
+		if conn != originalConn {
+			continue
+		}
+		go sendRaw(conn, b)
+	}
+}
+
 func processPong(c net.Conn, b []byte) {
-	buf := bytes.NewBuffer(b[24:])
+	buf := bytes.NewBuffer(b[23:])
+
 	var port uint16
 	err := binary.Read(buf, binary.BigEndian, &port)
 	if err != nil {
@@ -236,6 +277,8 @@ func processPong(c net.Conn, b []byte) {
 		fmt.Println("Could not read ip from Pong message: ", err)
 		return
 	}
+
+	tryAddPeer(ipBytes, port)
 }
 
 func processReply(c net.Conn, b []byte) {
@@ -260,6 +303,8 @@ func processReply(c net.Conn, b []byte) {
 		fmt.Println("Could not read ip from Pong message: ", err)
 		return
 	}
+
+	tryAddPeer(ipBytes, port)
 
 	size = size - 6
 	secretTextBytes := make([]byte, size)
