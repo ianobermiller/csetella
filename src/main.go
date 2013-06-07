@@ -203,7 +203,8 @@ func handleConnection(c net.Conn) {
 		peer2conn[peer] = c
 	}
 
-	for {
+	leftover := []byte{}
+	for {	
 		b := make([]byte, 2048)
 		n, err := c.Read(b)
 
@@ -220,8 +221,10 @@ func handleConnection(c net.Conn) {
 		if n == 0 {
 			continue
 		}
-
-		processRead(c, b[:n])
+		
+		b = append(leftover, b...)
+		n = n + len(leftover)
+		leftover = processRead(c, b[:n])
 	}
 }
 
@@ -229,18 +232,18 @@ func getKey(msgId []byte, mt MessageType) string {
 	return fmt.Sprintf("% x - %v", msgId, mt)
 }
 
-func processRead(c net.Conn, b []byte) {
+func processRead(c net.Conn, b []byte) []byte {
 	totalLen := len(b)
 	processed := 0
 
 	for processed < totalLen {
 		newlyProcessed := processMessage(c, b[processed:])
 		if newlyProcessed <= 0 {
-			log.Println("Processing failure.")
-			return
+			return b[processed:]
 		}
 		processed = processed + newlyProcessed
 	}
+	return []byte{}
 }
 
 // returns the length processed
@@ -259,9 +262,9 @@ func processMessage(c net.Conn, b []byte) int {
 		return -1
 	}
 
-	size = size + 23
+	size = size + 22
 
-	if len(b) < int(size) {
+	if len(b) <= int(size) {
 		log.Println("Packet size", len(b), "was less than specified:", size)
 		return -1
 	}
