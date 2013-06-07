@@ -41,7 +41,7 @@ func (t MessageType) String() string {
 const TIMER_INTERVAL = 5 * time.Second
 const TTL = 10
 const KNOWN_ADDRESS = "128.208.2.88:5002"
-const HOST = "128.208.1.137"
+const HOST = "128.208.1.139"
 const PORT = 20202
 const SECRET = "Ian Obermiller -- iano [at] cs.washington.edu -- 47249046"
 const LOG_FILE = "log.txt"
