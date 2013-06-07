@@ -260,6 +260,12 @@ func processMessage(c net.Conn, b []byte) int {
 	}
 
 	size = size + 23
+
+	if len(b) <= size {
+		log.Println("Packet size", len(b), "was less than specified:", size)
+		return -1
+	}
+
 	b = b[0:size]
 
 	t := MessageType(b[16])
