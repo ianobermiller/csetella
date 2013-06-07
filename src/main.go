@@ -204,7 +204,7 @@ func handleConnection(c net.Conn) {
 	}
 
 	leftover := []byte{}
-	for {	
+	for {
 		b := make([]byte, 2048)
 		n, err := c.Read(b)
 
@@ -221,7 +221,7 @@ func handleConnection(c net.Conn) {
 		if n == 0 {
 			continue
 		}
-		
+
 		b = append(leftover, b...)
 		n = n + len(leftover)
 		leftover = processRead(c, b[:n])
@@ -247,7 +247,7 @@ func processRead(c net.Conn, b []byte) []byte {
 }
 
 // returns the length processed
-func processMessage(c net.Conn, b []byte) int {
+func processMessage(c net.Conn, b []byte) int 
 	peer := c.RemoteAddr().String()
 	if len(b) < 23 {
 		log.Printf("RECV %s packet too small: % x", peer, b)
@@ -262,9 +262,9 @@ func processMessage(c net.Conn, b []byte) int {
 		return -1
 	}
 
-	size = size + 22
+	size = size + 23
 
-	if len(b) <= int(size) {
+	if len(b) < int(size) {
 		log.Println("Packet size", len(b), "was less than specified:", size)
 		return -1
 	}
@@ -395,7 +395,6 @@ func processReply(c net.Conn, msgId []byte, b []byte) {
 	secretTextBytes := make([]byte, size)
 	n, err = buf.Read(secretTextBytes)
 	if n != int(size) || err != nil {
-		log.Println("n", n, "size", size)
 		log.Println("Could not read secret text from Reply message: ", err)
 		return
 	}
