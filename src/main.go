@@ -39,6 +39,8 @@ func (t MessageType) String() string {
 	}
 }
 
+const LOG_PACKETS = false
+
 const TIMER_INTERVAL = 100 * time.Millisecond
 const TTL = 10
 const KNOWN_ADDRESS = "128.208.2.88:5002"
@@ -47,8 +49,8 @@ const PORT = 20202
 const SECRET = "Ian Obermiller -- iano [at] cs.washington.edu -- 47249046"
 const LOG_FILE = "log.txt"
 
-var host string
-var port int
+var externalHost string
+var externalPort int
 var secret string
 var knownAddress string
 var logFile string
@@ -66,8 +68,8 @@ func Usage() {
 }
 
 func main() {
-	flag.StringVar(&host, "host", HOST, "external ip to send in pongs")
-	flag.IntVar(&port, "port", PORT, "external port to listen on and send in pongs")
+	flag.StringVar(&externalHost, "host", HOST, "external ip to send in pongs")
+	flag.IntVar(&externalPort, "port", PORT, "external port to listen on and send in pongs")
 	flag.StringVar(&secret, "secret", SECRET, "secret text to send in replies")
 	flag.StringVar(&knownAddress, "seed", KNOWN_ADDRESS, "initial seed node to ping (format host:port)")
 	flag.StringVar(&logFile, "log", LOG_FILE, "log file to which secrets are written")
@@ -106,7 +108,14 @@ func main() {
 }
 
 func tryAddPeer(ipBytes []byte, port uint16) {
-	peer := fmt.Sprintf("%v:%v", net.IP(ipBytes).String(), port)
+	ip := net.IP(ipBytes).String()
+
+	if ip == externalHost && int(port) == externalPort {
+		// don't connect to self
+		return
+	}
+
+	peer := fmt.Sprintf("%v:%v", ip, port)
 	tryAddPeerString(peer)
 }
 
@@ -132,7 +141,7 @@ func connect(address string) {
 }
 
 func startListener() {
-	ln, err := net.Listen("tcp", fmt.Sprint(":", port))
+	ln, err := net.Listen("tcp", fmt.Sprint(":", externalPort))
 	if err != nil {
 		log.Println("Listen error: ", err)
 	}
@@ -157,8 +166,8 @@ func ping(c net.Conn) {
 
 func pong(c net.Conn, pingMessageId []byte) {
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, uint16(port))
-	buf.Write(net.ParseIP(host).To4())
+	binary.Write(buf, binary.BigEndian, uint16(externalPort))
+	buf.Write(net.ParseIP(externalHost).To4())
 	send(c, &Message{pingMessageId, Pong, TTL, 0, buf.Bytes()})
 }
 
@@ -168,18 +177,17 @@ func query(c net.Conn) {
 
 func reply(c net.Conn, queryMessageId []byte) {
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, uint16(port))
-	buf.Write(net.ParseIP(host).To4())
+	binary.Write(buf, binary.BigEndian, uint16(externalPort))
+	buf.Write(net.ParseIP(externalHost).To4())
 	buf.Write([]byte(secret))
 
 	send(c, &Message{queryMessageId, Reply, TTL, 0, buf.Bytes()})
 }
 
 func send(c net.Conn, msg *Message) {
-	//log.Println("SEND", msg)
-
-	key := msg.Key()
-	msgCache.Set(key, "", 0)
+	if LOG_PACKETS {
+		log.Println("SEND", msg)
+	}
 
 	b, err := msg.Bytes()
 	if err != nil {
@@ -187,7 +195,6 @@ func send(c net.Conn, msg *Message) {
 		return
 	}
 
-	//log.Printf("SEND %s %s - % x\n", t.String(), c.RemoteAddr(), b)
 	n, err := c.Write(b)
 	if n != len(b) || err != nil {
 		log.Println("Err writing to conn: ", err)
@@ -263,7 +270,6 @@ func handleConnection(c net.Conn) {
 		}
 
 		msg := Message{msgId, MessageType(msgType), ttl, hops, payload}
-		//log.Println("RECV", msg)
 		processMessage(c, &msg)
 	}
 
@@ -289,11 +295,15 @@ func processMessage(c net.Conn, msg *Message) {
 
 	key := msg.Key()
 	if _, found := msgCache.Get(key); found && (msg.MsgType == Ping || msg.MsgType == Query) {
-		//log.Println("Ignoring duplicate message", key)
+		//log.Println("Ignoring duplicate message", msg)
 		return
 	}
 
 	msgCache.Set(key, peer, 0)
+
+	if LOG_PACKETS {
+		log.Println("RECV", msg)
+	}
 
 	switch msg.MsgType {
 	case Ping:
@@ -329,11 +339,10 @@ func forwardMessage(originalConn net.Conn, msg *Message, excludeOriginal bool) {
 	msg.Hops = msg.Hops + 1 // increment hops
 
 	// forward to all connected peers
-	for conn, peer := range conn2peer {
+	for conn, _ := range conn2peer {
 		if (conn == originalConn) == excludeOriginal {
 			continue
 		}
-		peer = peer
 		go send(conn, msg)
 	}
 }
