@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"time"
@@ -37,7 +38,7 @@ func (t MessageType) String() string {
 	}
 }
 
-const TIMER_INTERVAL = 200 * time.Second
+const TIMER_INTERVAL = 2 * time.Second
 const KNOWN_ADDRESS = "128.208.2.88:5002"
 const HOST = "128.208.1.137"
 const PORT = 20202
@@ -52,8 +53,9 @@ var logFile string
 
 var conn2peer = make(map[net.Conn]string)
 var peer2conn = make(map[string]net.Conn)
-var gotSecret = make(map[string]bool)
-var msgCache = cache.New(5*time.Minute, 30*time.Second)
+var secrets = make(map[string]bool)
+
+var msgCache = cache.New(1*time.Minute, 30*time.Second)
 
 func Usage() {
 	fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS]\n", os.Args[0])
@@ -63,7 +65,7 @@ func Usage() {
 
 func main() {
 	flag.StringVar(&host, "host", HOST, "external ip to send in pongs")
-	flag.IntVar(&port, "port", PORT, "external port to send in pongs")
+	flag.IntVar(&port, "port", PORT, "external port to listen on and send in pongs")
 	flag.StringVar(&secret, "secret", SECRET, "secret text to send in replies")
 	flag.StringVar(&knownAddress, "seed", KNOWN_ADDRESS, "initial seed node to ping (format host:port)")
 	flag.StringVar(&logFile, "log", LOG_FILE, "log file to which secrets are written")
@@ -71,12 +73,21 @@ func main() {
 	flag.Usage = Usage
 	flag.Parse()
 
+	log.SetFlags(0)
+	log.SetPrefix(logFile + " ")
+
 	go startListener()
 
-	go connect(knownAddress)
+	tryAddPeerString(knownAddress)
 
 	shouldPing := true
 	for {
+		for p, c := range peer2conn {
+			if c == nil {
+				go connect(p)
+			}
+		}
+
 		for c, _ := range conn2peer {
 			if shouldPing {
 				go ping(c)
@@ -85,13 +96,9 @@ func main() {
 			}
 		}
 
-		for p, c := range peer2conn {
-			if c == nil {
-				go connect(p)
-			}
+		if len(conn2peer) > 0 {
+			shouldPing = !shouldPing
 		}
-
-		shouldPing = !shouldPing
 		time.Sleep(TIMER_INTERVAL)
 	}
 }
@@ -107,14 +114,15 @@ func tryAddPeerString(peer string) {
 			return
 		}
 	}
-	fmt.Println("Adding new peer ", peer)
+	log.Println("Adding new peer", peer)
 	peer2conn[peer] = nil
 }
 
 func connect(address string) {
+	log.Println("Connecting to", address)
 	conn, err := net.Dial("tcp", address)
 	if err != nil {
-		fmt.Println("Dial err:", err)
+		log.Println("Dial err:", err)
 		return
 	}
 
@@ -124,17 +132,18 @@ func connect(address string) {
 func startListener() {
 	ln, err := net.Listen("tcp", fmt.Sprint(":", port))
 	if err != nil {
-		fmt.Println("Listen error: ", err)
+		log.Println("Listen error: ", err)
 	}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Println("Accept error: ", err)
+			log.Println("Accept error: ", err)
 			continue
 		}
 
 		peer := conn.RemoteAddr().String()
-		fmt.Printf("Address %v connected to us!\n", peer)
+		log.Printf("Address %v connected to us!\n", peer)
+		conn2peer[conn] = peer
 
 		go handleConnection(conn)
 	}
@@ -156,7 +165,11 @@ func query(c net.Conn) {
 }
 
 func reply(c net.Conn, queryMessageId []byte) {
-	send(c, Reply, queryMessageId, []byte(secret))
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint16(port))
+	buf.Write(net.ParseIP(host).To4())
+	buf.Write([]byte(secret))
+	send(c, Reply, queryMessageId, buf.Bytes())
 }
 
 func send(c net.Conn, t MessageType, messageId []byte, payload []byte) {
@@ -165,15 +178,18 @@ func send(c net.Conn, t MessageType, messageId []byte, payload []byte) {
 		return
 	}
 
-	fmt.Printf("SEND %s %s - % x\n", t.String(), c.RemoteAddr(), b)
+	log.Printf("SEND %s %s - % x\n", t.String(), c.RemoteAddr(), b)
 
 	sendRaw(c, b)
 }
 
 func sendRaw(c net.Conn, b []byte) {
+	key := getKey(b[0:15], MessageType(b[16]))
+	msgCache.Set(key, true, 0)
+
 	n, err := c.Write(b)
 	if n != len(b) || err != nil {
-		fmt.Println("Err writing to conn: ", err)
+		log.Println("Err writing to conn: ", err)
 		return
 	}
 }
@@ -181,14 +197,17 @@ func sendRaw(c net.Conn, b []byte) {
 func handleConnection(c net.Conn) {
 	peer := c.RemoteAddr().String()
 	conn2peer[c] = peer
-	// `peer` is not the external address, so don't add to peer2conn
 
-	b := make([]byte, 2048)
+	if _, ok := peer2conn[peer]; ok {
+		peer2conn[peer] = c
+	}
+
 	for {
+		b := make([]byte, 2048)
 		n, err := c.Read(b)
 
 		if err != nil {
-			fmt.Println("Read err:", err)
+			log.Println("Read err:", err)
 			peer = conn2peer[c]
 			if _, ok := peer2conn[peer]; ok {
 				peer2conn[peer] = nil
@@ -201,47 +220,87 @@ func handleConnection(c net.Conn) {
 			continue
 		}
 
-		processMessage(c, b[:n])
+		processRead(c, b[:n])
 	}
 }
 
 func getKey(msgId []byte, mt MessageType) string {
-	return fmt.Sprint(msgId, "-", mt)
+	return fmt.Sprintf("% x - %v", msgId, mt)
 }
 
-func processMessage(c net.Conn, b []byte) {
+func processRead(c net.Conn, b []byte) {
+	totalLen := len(b)
+	processed := 0
+
+	for processed < totalLen {
+		newlyProcessed := processMessage(c, b[processed:])
+		if newlyProcessed <= 0 {
+			log.Println("Processing failure.")
+			return
+		}
+		processed = processed + newlyProcessed
+	}
+}
+
+// returns the length processed
+func processMessage(c net.Conn, b []byte) int {
 	peer := c.RemoteAddr().String()
 	if len(b) < 23 {
-		fmt.Printf("RECV %s packet too small: % x", peer, b)
-		return
+		log.Printf("RECV %s packet too small: % x", peer, b)
+		return -1
 	}
+
+	buf := bytes.NewBuffer(b[19:])
+	var size int32
+	err := binary.Read(buf, binary.BigEndian, &size)
+	if err != nil {
+		log.Println("Could not read size from Reply message: ", err)
+		return -1
+	}
+
+	size = size + 23
+	b = b[0:size]
 
 	t := MessageType(b[16])
 	msgId := b[:16]
-	fmt.Printf("RECV %s %s - % x\n", t, peer, b)
 
 	key := getKey(msgId, t)
 	if _, found := msgCache.Get(key); found {
-		return
+		//log.Println("Ignoring duplicate message", key)
+		return int(size)
 	}
 
-	msgCache.Set(key, true, 0)
+	log.Printf("RECV %s %s - % x\n", t, peer, b)
+
+	msgCache.Set(key, peer, 0)
 
 	switch t {
 	case Ping:
-		go pong(c, msgId)
-		forwardMessage(c, b)
+		go processPing(c, msgId, b)
 	case Query:
-		go reply(c, msgId)
-		forwardMessage(c, b)
+		go processQuery(c, msgId, b)
 	case Pong:
-		go processPong(c, b)
+		go processPong(c, msgId, b)
 	case Reply:
-		go processReply(c, b)
+		go processReply(c, msgId, b)
 	}
+
+	return int(size)
 }
 
-func forwardMessage(originalConn net.Conn, b []byte) {
+func processPing(c net.Conn, msgId []byte, b []byte) {
+	go pong(c, msgId)
+	forwardMessage(c, b, true)
+}
+
+func processQuery(c net.Conn, msgId []byte, b []byte) {
+	go reply(c, msgId)
+	forwardMessage(c, b, true)
+}
+
+// Pass true to excludeOriginal to forward to all but the original
+// Pass false to forward to only the original
+func forwardMessage(originalConn net.Conn, b []byte, excludeOriginal bool) {
 	ttl := b[17]
 
 	if ttl <= 1 {
@@ -253,54 +312,70 @@ func forwardMessage(originalConn net.Conn, b []byte) {
 	b[18] = b[18] + 1 // increment hops
 
 	// forward to all connected peers
-	for conn, _ := range conn2peer {
-		if conn != originalConn {
+	//log.Println("Forwarding to", len(conn2peer)-1, "peers")
+	for conn, peer := range conn2peer {
+		if (conn == originalConn) == excludeOriginal {
 			continue
 		}
+		peer = peer
+		//log.Println("Forwarding message to", peer)
 		go sendRaw(conn, b)
 	}
 }
 
-func processPong(c net.Conn, b []byte) {
+func processPong(c net.Conn, msgId []byte, b []byte) {
 	buf := bytes.NewBuffer(b[23:])
 
 	var port uint16
 	err := binary.Read(buf, binary.BigEndian, &port)
 	if err != nil {
-		fmt.Println("Could not read port from Pong message: ", err)
+		log.Println("Could not read port from Pong message: ", err)
 		return
 	}
 
 	ipBytes := make([]byte, 4)
 	n, err := buf.Read(ipBytes)
 	if n != 4 || err != nil {
-		fmt.Println("Could not read ip from Pong message: ", err)
+		log.Println("Could not read ip from Pong message: ", err)
 		return
 	}
 
 	tryAddPeer(ipBytes, port)
+
+	key := getKey(msgId, Ping)
+	if peer, found := msgCache.Get(key); found {
+		// Send the pong back to the original pinger
+		if conn, found := peer2conn[peer.(string)]; found {
+			forwardMessage(conn, b, false)
+		}
+	}
 }
 
-func processReply(c net.Conn, b []byte) {
+func processReply(c net.Conn, msgId []byte, b []byte) {
 	buf := bytes.NewBuffer(b[19:])
 	var size int32
 	err := binary.Read(buf, binary.BigEndian, &size)
 	if err != nil {
-		fmt.Println("Could not read size from Reply message: ", err)
+		log.Println("Could not read size from Reply message: ", err)
+		return
+	}
+
+	if size < 6 {
+		log.Printf("Invalid reply message, size of payload too short: %v\n% x\n", size, b)
 		return
 	}
 
 	var port uint16
 	err = binary.Read(buf, binary.BigEndian, &port)
 	if err != nil {
-		fmt.Println("Could not read port from Pong message: ", err)
+		log.Println("Could not read port from Pong message: ", err)
 		return
 	}
 
 	ipBytes := make([]byte, 4)
 	n, err := buf.Read(ipBytes)
 	if n != 4 || err != nil {
-		fmt.Println("Could not read ip from Pong message: ", err)
+		log.Println("Could not read ip from Pong message: ", err)
 		return
 	}
 
@@ -310,22 +385,37 @@ func processReply(c net.Conn, b []byte) {
 	secretTextBytes := make([]byte, size)
 	n, err = buf.Read(secretTextBytes)
 	if n != int(size) || err != nil {
-		fmt.Println("n", n, "size", size)
-		fmt.Println("Could not read secret text from Reply message: ", err)
+		log.Println("n", n, "size", size)
+		log.Println("Could not read secret text from Reply message: ", err)
 		return
 	}
 
-	log := fmt.Sprintf("Address %v:%v sent secret text \"%v\"\n", net.IP(ipBytes).String(), port, string(secretTextBytes))
-	fmt.Print(log)
+	key := getKey(msgId, Reply)
+	if peer, found := msgCache.Get(key); found {
+		// Send the reply back to the original pinger
+		if conn, found := peer2conn[peer.(string)]; found {
+			forwardMessage(conn, b, false)
+		}
+	}
+
+	msg := fmt.Sprintf("Address %v:%v sent secret text \"%v\"\n", net.IP(ipBytes).String(), port, string(secretTextBytes))
+
+	if _, ok := secrets[msg]; ok {
+		return
+	}
+
+	secrets[msg] = true
+
+	log.Print(msg)
 	file, err := os.OpenFile(logFile, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
-		fmt.Println("Could not open file: ", err)
+		log.Println("Could not open file: ", err)
 	}
 	defer file.Close()
 
-	n, err = file.WriteString(log)
-	if n != len(log) || err != nil {
-		fmt.Println("WriteString error to log: ", err)
+	n, err = file.WriteString(msg)
+	if n != len(msg) || err != nil {
+		log.Println("WriteString error to log: ", err)
 	}
 	file.Sync()
 }
@@ -351,37 +441,37 @@ func buildMessage(
 
 	n, err := buf.Write(messageId)
 	if n != len(messageId) || err != nil {
-		fmt.Println("Err:", err)
+		log.Println("Err:", err)
 		return
 	}
 
 	err = buf.WriteByte(byte(messageType))
 	if err != nil {
-		fmt.Println("Err:", err)
+		log.Println("Err:", err)
 		return
 	}
 
 	err = buf.WriteByte(ttl)
 	if err != nil {
-		fmt.Println("Err:", err)
+		log.Println("Err:", err)
 		return
 	}
 
 	err = buf.WriteByte(hops)
 	if err != nil {
-		fmt.Println("Err:", err)
+		log.Println("Err:", err)
 		return
 	}
 
 	err = binary.Write(buf, binary.BigEndian, int32(len(payload)))
 	if err != nil {
-		fmt.Println("Err:", err)
+		log.Println("Err:", err)
 		return
 	}
 
 	n, err = buf.Write(payload)
 	if n != len(payload) || err != nil {
-		fmt.Println("Err:", err)
+		log.Println("Err:", err)
 		return
 	}
 
