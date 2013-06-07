@@ -235,7 +235,11 @@ func handleConnection(c net.Conn) {
 	for {
 		msgId := make([]byte, 16)
 		n, err := io.ReadFull(c, msgId)
-		if n != 16 || err != nil {
+		if n != 16 {
+			err = errors.New(fmt.Sprint("Could not read 16 bytes for msgid, only got", n))
+			break
+		}
+		if err != nil {
 			break
 		}
 
@@ -274,6 +278,7 @@ func handleConnection(c net.Conn) {
 	}
 
 	log.Println("Read err:", err)
+	log.Println("Closing conn:", c.RemoteAddr())
 	peer = conn2peer[c]
 	if _, ok := peer2conn[peer]; ok {
 		peer2conn[peer] = nil
