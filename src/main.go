@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -38,7 +39,7 @@ func (t MessageType) String() string {
 	}
 }
 
-const TIMER_INTERVAL = 5 * time.Second
+const TIMER_INTERVAL = 100 * time.Millisecond
 const TTL = 10
 const KNOWN_ADDRESS = "128.208.2.88:5002"
 const HOST = "128.208.1.139"
@@ -151,18 +152,18 @@ func startListener() {
 }
 
 func ping(c net.Conn) {
-	send(c, Ping, genId(), []byte{})
+	send(c, &Message{genId(), Ping, TTL, 0, []byte{}})
 }
 
 func pong(c net.Conn, pingMessageId []byte) {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint16(port))
 	buf.Write(net.ParseIP(host).To4())
-	send(c, Pong, pingMessageId, buf.Bytes())
+	send(c, &Message{pingMessageId, Pong, TTL, 0, buf.Bytes()})
 }
 
 func query(c net.Conn) {
-	send(c, Query, genId(), []byte{})
+	send(c, &Message{genId(), Query, TTL, 0, []byte{}})
 }
 
 func reply(c net.Conn, queryMessageId []byte) {
@@ -170,29 +171,49 @@ func reply(c net.Conn, queryMessageId []byte) {
 	binary.Write(buf, binary.BigEndian, uint16(port))
 	buf.Write(net.ParseIP(host).To4())
 	buf.Write([]byte(secret))
-	send(c, Reply, queryMessageId, buf.Bytes())
+
+	send(c, &Message{queryMessageId, Reply, TTL, 0, buf.Bytes()})
 }
 
-func send(c net.Conn, t MessageType, messageId []byte, payload []byte) {
-	b, err := buildMessage(messageId, t, TTL, 0, payload)
+func send(c net.Conn, msg *Message) {
+	//log.Println("SEND", msg)
+
+	key := msg.Key()
+	msgCache.Set(key, "", 0)
+
+	b, err := msg.Bytes()
 	if err != nil {
+		log.Println("Err converting msg to bytes: ", err)
 		return
 	}
 
 	//log.Printf("SEND %s %s - % x\n", t.String(), c.RemoteAddr(), b)
-
-	sendRaw(c, b)
-}
-
-func sendRaw(c net.Conn, b []byte) {
-	key := getKey(b[0:15], MessageType(b[16]))
-	msgCache.Set(key, "", 0)
-
 	n, err := c.Write(b)
 	if n != len(b) || err != nil {
 		log.Println("Err writing to conn: ", err)
 		return
 	}
+}
+
+func readByte(r io.Reader) (b byte, err error) {
+	bs := make([]byte, 1)
+	n, err := r.Read(bs)
+	if err != nil {
+		return
+	}
+	if n != 1 {
+		err = errors.New("Couldn't even read one byte.")
+		return
+	}
+	return bs[0], nil
+}
+
+type Message struct {
+	MsgId   []byte
+	MsgType MessageType
+	TTL     byte
+	Hops    byte
+	Payload []byte
 }
 
 func handleConnection(c net.Conn) {
@@ -203,138 +224,122 @@ func handleConnection(c net.Conn) {
 		peer2conn[peer] = c
 	}
 
-	leftover := []byte{}
+	var err error = nil
 	for {
-		b := make([]byte, 2048)
-		n, err := c.Read(b)
-
-		if err != nil {
-			log.Println("Read err:", err)
-			peer = conn2peer[c]
-			if _, ok := peer2conn[peer]; ok {
-				peer2conn[peer] = nil
-			}
-			delete(conn2peer, c)
+		msgId := make([]byte, 16)
+		n, err := io.ReadFull(c, msgId)
+		if n != 16 || err != nil {
 			break
 		}
 
-		if n == 0 {
-			continue
+		msgType, err := readByte(c)
+		if err != nil {
+			break
 		}
 
-		b = append(leftover, b...)
-		n = n + len(leftover)
-		leftover = processRead(c, b[:n])
+		ttl, err := readByte(c)
+		if err != nil {
+			break
+		}
+
+		hops, err := readByte(c)
+		if err != nil {
+			break
+		}
+
+		var size int32
+		err = binary.Read(c, binary.BigEndian, &size)
+		if err != nil {
+			break
+		}
+
+		payload := make([]byte, size)
+		if size > 0 {
+			n, err = io.ReadFull(c, payload)
+			if n != int(size) || err != nil {
+				log.Println("Err reading payload:", n, err)
+				break
+			}
+		}
+
+		msg := Message{msgId, MessageType(msgType), ttl, hops, payload}
+		//log.Println("RECV", msg)
+		processMessage(c, &msg)
 	}
+
+	log.Println("Read err:", err)
+	peer = conn2peer[c]
+	if _, ok := peer2conn[peer]; ok {
+		peer2conn[peer] = nil
+	}
+	delete(conn2peer, c)
+}
+
+func (msg *Message) Key() string {
+	return getKey(msg.MsgId, msg.MsgType)
 }
 
 func getKey(msgId []byte, mt MessageType) string {
 	return fmt.Sprintf("% x - %v", msgId, mt)
 }
 
-func processRead(c net.Conn, b []byte) []byte {
-	totalLen := len(b)
-	processed := 0
-
-	for processed < totalLen {
-		newlyProcessed := processMessage(c, b[processed:])
-		if newlyProcessed <= 0 {
-			return b[processed:]
-		}
-		processed = processed + newlyProcessed
-	}
-	return []byte{}
-}
-
 // returns the length processed
-func processMessage(c net.Conn, b []byte) int {
+func processMessage(c net.Conn, msg *Message) {
 	peer := c.RemoteAddr().String()
-	if len(b) < 23 {
-		log.Printf("RECV %s packet too small: % x", peer, b)
-		return -1
-	}
 
-	buf := bytes.NewBuffer(b[19:])
-	var size int32
-	err := binary.Read(buf, binary.BigEndian, &size)
-	if err != nil {
-		log.Println("Could not read size from Reply message: ", err)
-		return -1
-	}
-
-	size = size + 23
-
-	if len(b) < int(size) {
-		log.Println("Packet size", len(b), "was less than specified:", size)
-		return -1
-	}
-
-	b = b[0:size]
-
-	t := MessageType(b[16])
-	msgId := b[:16]
-
-	key := getKey(msgId, t)
-	if _, found := msgCache.Get(key); found && (t == Ping || t == Query) {
+	key := msg.Key()
+	if _, found := msgCache.Get(key); found && (msg.MsgType == Ping || msg.MsgType == Query) {
 		//log.Println("Ignoring duplicate message", key)
-		return int(size)
+		return
 	}
-
-	//log.Printf("RECV %s %s - % x\n", t, peer, b)
 
 	msgCache.Set(key, peer, 0)
 
-	switch t {
+	switch msg.MsgType {
 	case Ping:
-		go processPing(c, msgId, b)
+		go processPing(c, msg)
 	case Query:
-		go processQuery(c, msgId, b)
+		go processQuery(c, msg)
 	case Pong:
-		go processPong(c, msgId, b)
+		go processPong(c, msg)
 	case Reply:
-		go processReply(c, msgId, b)
+		go processReply(c, msg)
 	}
-
-	return int(size)
 }
 
-func processPing(c net.Conn, msgId []byte, b []byte) {
-	go pong(c, msgId)
-	forwardMessage(c, b, true)
+func processPing(c net.Conn, msg *Message) {
+	go pong(c, msg.MsgId)
+	forwardMessage(c, msg, true)
 }
 
-func processQuery(c net.Conn, msgId []byte, b []byte) {
-	go reply(c, msgId)
-	forwardMessage(c, b, true)
+func processQuery(c net.Conn, msg *Message) {
+	go reply(c, msg.MsgId)
+	forwardMessage(c, msg, true)
 }
 
 // Pass true to excludeOriginal to forward to all but the original
 // Pass false to forward to only the original
-func forwardMessage(originalConn net.Conn, b []byte, excludeOriginal bool) {
-	ttl := b[17]
-
-	if ttl <= 1 {
+func forwardMessage(originalConn net.Conn, msg *Message, excludeOriginal bool) {
+	if msg.TTL <= 1 {
 		// don't forward
 		return
 	}
 
-	b[17] = ttl - 1   // decrement ttl
-	b[18] = b[18] + 1 // increment hops
+	msg.TTL = msg.TTL - 1   // decrement ttl
+	msg.Hops = msg.Hops + 1 // increment hops
 
 	// forward to all connected peers
-	//log.Println("Forwarding to", len(conn2peer)-1, "peers")
 	for conn, peer := range conn2peer {
 		if (conn == originalConn) == excludeOriginal {
 			continue
 		}
 		peer = peer
-		//log.Println("Forwarding message to", peer)
-		go sendRaw(conn, b)
+		go send(conn, msg)
 	}
 }
 
-func processPong(c net.Conn, msgId []byte, b []byte) {
-	buf := bytes.NewBuffer(b[23:])
+func processPong(c net.Conn, msg *Message) {
+	buf := bytes.NewBuffer(msg.Payload)
 
 	var port uint16
 	err := binary.Read(buf, binary.BigEndian, &port)
@@ -352,31 +357,20 @@ func processPong(c net.Conn, msgId []byte, b []byte) {
 
 	tryAddPeer(ipBytes, port)
 
-	key := getKey(msgId, Ping)
+	key := getKey(msg.MsgId, Ping)
 	if peer, found := msgCache.Get(key); found {
 		// Send the pong back to the original pinger
 		if conn, found := peer2conn[peer.(string)]; found {
-			forwardMessage(conn, b, false)
+			forwardMessage(conn, msg, false)
 		}
 	}
 }
 
-func processReply(c net.Conn, msgId []byte, b []byte) {
-	buf := bytes.NewBuffer(b[19:])
-	var size int32
-	err := binary.Read(buf, binary.BigEndian, &size)
-	if err != nil {
-		log.Println("Could not read size from Reply message: ", err)
-		return
-	}
-
-	if size < 6 {
-		log.Printf("Invalid reply message, size of payload too short: %v\n% x\n", size, b)
-		return
-	}
+func processReply(c net.Conn, msg *Message) {
+	buf := bytes.NewBuffer(msg.Payload)
 
 	var port uint16
-	err = binary.Read(buf, binary.BigEndian, &port)
+	err := binary.Read(buf, binary.BigEndian, &port)
 	if err != nil {
 		log.Println("Could not read port from Pong message: ", err)
 		return
@@ -391,39 +385,39 @@ func processReply(c net.Conn, msgId []byte, b []byte) {
 
 	tryAddPeer(ipBytes, port)
 
-	size = size - 6
-	secretTextBytes := make([]byte, size)
+	textSize := len(msg.Payload) - 6 // 6 bytes for ip and port
+	secretTextBytes := make([]byte, textSize)
 	n, err = buf.Read(secretTextBytes)
-	if n != int(size) || err != nil {
+	if n != textSize || err != nil {
 		log.Println("Could not read secret text from Reply message: ", err)
 		return
 	}
 
-	key := getKey(msgId, Reply)
+	key := getKey(msg.MsgId, Reply)
 	if peer, found := msgCache.Get(key); found {
 		// Send the reply back to the original pinger
 		if conn, found := peer2conn[peer.(string)]; found {
-			forwardMessage(conn, b, false)
+			forwardMessage(conn, msg, false)
 		}
 	}
 
-	msg := fmt.Sprintf("Address %v:%v sent secret text \"%v\"\n", net.IP(ipBytes).String(), port, string(secretTextBytes))
+	logMsg := fmt.Sprintf("Address %v:%v sent secret text \"%v\"\n", net.IP(ipBytes).String(), port, string(secretTextBytes))
 
-	if _, ok := secrets[msg]; ok {
+	if _, ok := secrets[logMsg]; ok {
 		return
 	}
 
-	secrets[msg] = true
+	secrets[logMsg] = true
 
-	log.Print(msg)
+	log.Print(logMsg)
 	file, err := os.OpenFile(logFile, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		log.Println("Could not open file: ", err)
 	}
 	defer file.Close()
 
-	n, err = file.WriteString(msg)
-	if n != len(msg) || err != nil {
+	n, err = file.WriteString(logMsg)
+	if n != len(logMsg) || err != nil {
 		log.Println("WriteString error to log: ", err)
 	}
 	file.Sync()
@@ -438,48 +432,45 @@ func genId() (messageId []byte) {
 	return
 }
 
-func buildMessage(
-	messageId []byte,
-	messageType MessageType,
-	ttl byte,
-	hops byte,
-	payload []byte) (b []byte, err error) {
+func (msg *Message) Bytes() (b []byte, err error) {
 
 	b = nil
 	buf := new(bytes.Buffer)
 
-	n, err := buf.Write(messageId)
-	if n != len(messageId) || err != nil {
+	n, err := buf.Write(msg.MsgId)
+	if n != len(msg.MsgId) || err != nil {
 		log.Println("Err:", err)
 		return
 	}
 
-	err = buf.WriteByte(byte(messageType))
+	err = buf.WriteByte(byte(msg.MsgType))
 	if err != nil {
 		log.Println("Err:", err)
 		return
 	}
 
-	err = buf.WriteByte(ttl)
+	err = buf.WriteByte(msg.TTL)
 	if err != nil {
 		log.Println("Err:", err)
 		return
 	}
 
-	err = buf.WriteByte(hops)
+	err = buf.WriteByte(msg.Hops)
 	if err != nil {
 		log.Println("Err:", err)
 		return
 	}
 
-	err = binary.Write(buf, binary.BigEndian, int32(len(payload)))
+	size := int32(len(msg.Payload))
+
+	err = binary.Write(buf, binary.BigEndian, size)
 	if err != nil {
 		log.Println("Err:", err)
 		return
 	}
 
-	n, err = buf.Write(payload)
-	if n != len(payload) || err != nil {
+	n, err = buf.Write(msg.Payload)
+	if n != len(msg.Payload) || err != nil {
 		log.Println("Err:", err)
 		return
 	}
