@@ -38,7 +38,8 @@ func (t MessageType) String() string {
 	}
 }
 
-const TIMER_INTERVAL = 2 * time.Second
+const TIMER_INTERVAL = 5 * time.Second
+const TTL = 10
 const KNOWN_ADDRESS = "128.208.2.88:5002"
 const HOST = "128.208.1.137"
 const PORT = 20202
@@ -173,19 +174,19 @@ func reply(c net.Conn, queryMessageId []byte) {
 }
 
 func send(c net.Conn, t MessageType, messageId []byte, payload []byte) {
-	b, err := buildMessage(messageId, t, 10, 0, payload)
+	b, err := buildMessage(messageId, t, TTL, 0, payload)
 	if err != nil {
 		return
 	}
 
-	log.Printf("SEND %s %s - % x\n", t.String(), c.RemoteAddr(), b)
+	//log.Printf("SEND %s %s - % x\n", t.String(), c.RemoteAddr(), b)
 
 	sendRaw(c, b)
 }
 
 func sendRaw(c net.Conn, b []byte) {
 	key := getKey(b[0:15], MessageType(b[16]))
-	msgCache.Set(key, true, 0)
+	msgCache.Set(key, "", 0)
 
 	n, err := c.Write(b)
 	if n != len(b) || err != nil {
@@ -265,12 +266,12 @@ func processMessage(c net.Conn, b []byte) int {
 	msgId := b[:16]
 
 	key := getKey(msgId, t)
-	if _, found := msgCache.Get(key); found {
+	if _, found := msgCache.Get(key); found && (t == Ping || t == Query) {
 		//log.Println("Ignoring duplicate message", key)
 		return int(size)
 	}
 
-	log.Printf("RECV %s %s - % x\n", t, peer, b)
+	//log.Printf("RECV %s %s - % x\n", t, peer, b)
 
 	msgCache.Set(key, peer, 0)
 
