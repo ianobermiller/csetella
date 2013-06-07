@@ -247,7 +247,7 @@ func processRead(c net.Conn, b []byte) []byte {
 }
 
 // returns the length processed
-func processMessage(c net.Conn, b []byte) int 
+func processMessage(c net.Conn, b []byte) int {
 	peer := c.RemoteAddr().String()
 	if len(b) < 23 {
 		log.Printf("RECV %s packet too small: % x", peer, b)
