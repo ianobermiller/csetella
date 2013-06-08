@@ -399,13 +399,7 @@ func processReply(c net.Conn, msg *Message) {
 
 	tryAddPeer(ipBytes, port)
 
-	textSize := len(msg.Payload) - 6 // 6 bytes for ip and port
-	secretTextBytes := make([]byte, textSize)
-	n, err = buf.Read(secretTextBytes)
-	if n != textSize || err != nil {
-		log.Println("Could not read secret text from Reply message: ", err)
-		return
-	}
+	secretText := string(msg.Payload[6:])
 
 	key := getKey(msg.MsgId, Reply)
 	if peer, found := msgCache.Get(key); found {
@@ -415,7 +409,7 @@ func processReply(c net.Conn, msg *Message) {
 		}
 	}
 
-	logMsg := fmt.Sprintf("Address %v:%v sent secret text \"%v\"\n", net.IP(ipBytes).String(), port, string(secretTextBytes))
+	logMsg := fmt.Sprintf("Address %v:%v sent secret text \"%v\"\n", net.IP(ipBytes).String(), port, secretText)
 
 	if _, ok := secrets[logMsg]; ok {
 		return
