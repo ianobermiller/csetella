@@ -41,7 +41,7 @@ func (t MessageType) String() string {
 
 const LOG_PACKETS = false
 
-const TIMER_INTERVAL = 100 * time.Millisecond
+const TIMER_INTERVAL = 5 * time.Second
 const TTL = 10
 const KNOWN_ADDRESS = "128.208.2.88:5002"
 const HOST = "128.208.1.139"
