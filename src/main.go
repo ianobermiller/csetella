@@ -8,9 +8,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"time"
 )
@@ -39,15 +41,19 @@ func (t MessageType) String() string {
 	}
 }
 
+// Debugging
 const LOG_PACKETS = false
 
-const TIMER_INTERVAL = 5 * time.Second
-const TTL = 10
-const KNOWN_ADDRESS = "128.208.2.88:5002"
-const HOST = "128.208.1.139"
-const PORT = 20202
-const SECRET = "Ian Obermiller -- iano [at] cs.washington.edu -- 47249046"
-const LOG_FILE = "log.txt"
+// Defaults
+const (
+	TIMER_INTERVAL = 5 * time.Second
+	TTL            = 10
+	KNOWN_ADDRESS  = "128.208.2.88:5002"
+	HOST           = "128.208.1.139"
+	PORT           = 20202
+	SECRET         = "Ian Obermiller -- iano [at] cs.washington.edu -- 47249046"
+	LOG_FILE       = "log.txt"
+)
 
 var externalHost string
 var externalPort int
@@ -55,10 +61,19 @@ var secret string
 var knownAddress string
 var logFile string
 
+// Maps connections to their peer string (IP:PORT)
 var conn2peer = make(map[net.Conn]string)
+
+// Maps a peer string to their connection, which may be nil
 var peer2conn = make(map[string]net.Conn)
+
+// Map of secret texts we have seen this sessions, so we don't write them out again
 var secrets = make(map[string]bool)
 
+// Cache of recent messages's we have seen, entries expire after 1 minute
+// Key is msgId-type.
+// Value is the peer string, so this is double duty as the routing table for incoming
+//  pongs and replies.
 var msgCache = cache.New(1*time.Minute, 30*time.Second)
 
 func Usage() {
@@ -80,6 +95,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix(logFile + " ")
 
+	go startWebServer()
 	go startListener()
 
 	tryAddPeerString(knownAddress)
@@ -105,6 +121,53 @@ func main() {
 		}
 		time.Sleep(TIMER_INTERVAL)
 	}
+}
+
+type templateParams struct {
+	Replies map[string]bool
+	Uptime  string
+	Peers   map[net.Conn]string
+}
+
+var startTime = time.Now()
+
+func startWebServer() {
+	t, err := template.New("mainTemplate").Parse(`
+<html><body>
+<h1>Iano's CSEtella Node</h1>
+
+<h2>Stats</h2>
+Uptime: {{.Uptime}}
+
+<h2>Peers</h2>
+<ul>
+	{{range $_, $peer := .Peers}}
+	<li>{{$peer}}</li>
+	{{end}}
+</ul>
+
+<h2>Replies Observed</h2>
+<ul>
+	{{range $reply, $_ := .Replies}}
+	<li>{{$reply}}</li>
+	{{end}}
+</ul>
+
+</body></html>`)
+	if err != nil {
+		log.Fatalln("Error compiling template: ", err)
+	}
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		p := templateParams{
+			Replies: secrets,
+			Uptime:  time.Now().Sub(startTime).String(),
+			Peers:   conn2peer,
+		}
+
+		err = t.Execute(w, p)
+	})
+
+	log.Fatal(http.ListenAndServe(":20201", nil))
 }
 
 func tryAddPeer(ipBytes []byte, port uint16) {
@@ -261,6 +324,11 @@ func handleConnection(c net.Conn) {
 		var size int32
 		err = binary.Read(c, binary.BigEndian, &size)
 		if err != nil {
+			break
+		}
+
+		if size > 2048 {
+			err = errors.New(fmt.Sprint("Payload size", size, "was unexpectedly large."))
 			break
 		}
 
