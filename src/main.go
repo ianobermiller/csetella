@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	_ "expvar"
 	"flag"
 	"fmt"
 	"html/template"
@@ -46,13 +47,14 @@ const LOG_PACKETS = false
 
 // Defaults
 const (
-	TIMER_INTERVAL = 5 * time.Second
-	TTL            = 10
-	KNOWN_ADDRESS  = "128.208.2.88:5002"
-	HOST           = "128.208.1.139"
-	PORT           = 20202
-	SECRET         = "Ian Obermiller -- iano [at] cs.washington.edu -- 47249046"
-	LOG_FILE       = "log.txt"
+	TIMER_INTERVAL     = 5 * time.Second
+	CONNECTION_TIMEOUT = 3 * time.Second
+	TTL                = 10
+	KNOWN_ADDRESS      = "128.208.2.88:5002"
+	HOST               = "128.208.1.139"
+	PORT               = 20202
+	SECRET             = "Ian Obermiller -- iano [at] cs.washington.edu -- 47249046"
+	LOG_FILE           = "log.txt"
 )
 
 type CapturedReply struct {
@@ -74,7 +76,7 @@ var conn2peer = make(map[net.Conn]string)
 var peer2conn = make(map[string]net.Conn)
 
 // Map of secret texts we have seen this sessions, so we don't write them out again
-var repliesSeen = make(map[CapturedReply]bool)
+var repliesSeen = make(map[string]CapturedReply)
 
 // Cache of recent messages's we have seen, entries expire after 1 minute
 // Key is msgId-type.
@@ -110,15 +112,15 @@ func main() {
 	for {
 		for p, c := range peer2conn {
 			if c == nil {
-				go connect(p)
+				connect(p)
 			}
 		}
 
 		for c, _ := range conn2peer {
 			if shouldPing {
-				go ping(c)
+				ping(c)
 			} else {
-				go query(c)
+				query(c)
 			}
 		}
 
@@ -130,7 +132,7 @@ func main() {
 }
 
 type templateParams struct {
-	Replies map[CapturedReply]bool
+	Replies map[string]CapturedReply
 	Uptime  string
 	Peers   map[net.Conn]string
 }
@@ -159,7 +161,7 @@ Uptime: {{.Uptime}}
 		<th>When</th>
 		<th>Text</th>
 	</tr>
-	{{range $reply, $_ := .Replies}}
+	{{range $_, $reply := .Replies}}
 	<tr>
 		<td>{{$reply.FromPeer}}</td>
 		<td>{{$reply.TimeSeen}}</td>
@@ -209,7 +211,7 @@ func tryAddPeerString(peer string) {
 
 func connect(address string) {
 	log.Println("Connecting to", address)
-	conn, err := net.Dial("tcp", address)
+	conn, err := net.DialTimeout("tcp", address, CONNECTION_TIMEOUT)
 	if err != nil {
 		log.Println("Dial err:", err)
 		return
@@ -338,8 +340,18 @@ func handleConnection(c net.Conn) {
 			break
 		}
 
+		if ttl > 100 {
+			err = errors.New(fmt.Sprint("TTL", ttl, "was unexpectedly large."))
+			break
+		}
+
 		hops, err := readByte(c)
 		if err != nil {
+			break
+		}
+
+		if hops > 100 {
+			err = errors.New(fmt.Sprint("Hops", hops, "was unexpectedly large."))
 			break
 		}
 
@@ -349,7 +361,7 @@ func handleConnection(c net.Conn) {
 			break
 		}
 
-		if size > 2048 {
+		if size > 1000 {
 			err = errors.New(fmt.Sprint("Payload size", size, "was unexpectedly large."))
 			break
 		}
@@ -406,23 +418,23 @@ func processMessage(c net.Conn, msg *Message) {
 
 	switch msg.MsgType {
 	case Ping:
-		go processPing(c, msg)
+		processPing(c, msg)
 	case Query:
-		go processQuery(c, msg)
+		processQuery(c, msg)
 	case Pong:
-		go processPong(c, msg)
+		processPong(c, msg)
 	case Reply:
-		go processReply(c, msg)
+		processReply(c, msg)
 	}
 }
 
 func processPing(c net.Conn, msg *Message) {
-	go pong(c, msg.MsgId)
+	pong(c, msg.MsgId)
 	forwardMessage(c, msg, true)
 }
 
 func processQuery(c net.Conn, msg *Message) {
-	go reply(c, msg.MsgId)
+	reply(c, msg.MsgId)
 	forwardMessage(c, msg, true)
 }
 
@@ -442,7 +454,7 @@ func forwardMessage(originalConn net.Conn, msg *Message, excludeOriginal bool) {
 		if (conn == originalConn) == excludeOriginal {
 			continue
 		}
-		go send(conn, msg)
+		send(conn, msg)
 	}
 }
 
@@ -503,18 +515,21 @@ func processReply(c net.Conn, msg *Message) {
 		}
 	}
 
-	logMsg := fmt.Sprintf("Address %v:%v sent secret text \"%v\" (size %v)\n", net.IP(ipBytes).String(), port, secretText, len(msg.Payload)-6)
+	peer := fmt.Sprintf("%v:%v", net.IP(ipBytes).String(), port)
+
+	logMsg := fmt.Sprintf("Peer %v sent secret text \"%v\" (size %v)\n", peer, secretText, len(msg.Payload)-6)
 
 	rep := CapturedReply{
-		FromPeer: fmt.Sprintf("%v:%v", net.IP(ipBytes).String(), port),
+		FromPeer: peer,
 		TimeSeen: time.Now(),
 		Text:     secretText}
 
-	if _, ok := repliesSeen[rep]; ok {
+	replyKey := peer + "-" + secretText
+	if _, ok := repliesSeen[replyKey]; ok {
 		return
 	}
 
-	repliesSeen[rep] = true
+	repliesSeen[replyKey] = rep
 
 	log.Print(logMsg)
 	file, err := os.OpenFile(logFile, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0666)
