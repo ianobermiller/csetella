@@ -478,7 +478,7 @@ func processReply(c net.Conn, msg *Message) {
 
 	tryAddPeer(ipBytes, port)
 
-	secretText := string(msg.Payload[6:])
+	secretText := string(trimNullBytesFromEnd(msg.Payload[6:]))
 
 	key := getKey(msg.MsgId, Reply)
 	if peer, found := msgCache.Get(key); found {
@@ -508,6 +508,15 @@ func processReply(c net.Conn, msg *Message) {
 		log.Println("WriteString error to log: ", err)
 	}
 	file.Sync()
+}
+
+func trimNullBytesFromEnd(b []byte) []byte {
+	for i, by := range b {
+		if by == 0 {
+			return b[0:i]
+		}
+	}
+	return b
 }
 
 func genId() (messageId []byte) {
