@@ -55,6 +55,12 @@ const (
 	LOG_FILE       = "log.txt"
 )
 
+type CapturedReply struct {
+	FromPeer string
+	TimeSeen time.Time
+	Text     string
+}
+
 var externalHost string
 var externalPort int
 var secret string
@@ -68,7 +74,7 @@ var conn2peer = make(map[net.Conn]string)
 var peer2conn = make(map[string]net.Conn)
 
 // Map of secret texts we have seen this sessions, so we don't write them out again
-var secrets = make(map[string]bool)
+var repliesSeen = make(map[CapturedReply]bool)
 
 // Cache of recent messages's we have seen, entries expire after 1 minute
 // Key is msgId-type.
@@ -124,7 +130,7 @@ func main() {
 }
 
 type templateParams struct {
-	Replies map[string]bool
+	Replies map[CapturedReply]bool
 	Uptime  string
 	Peers   map[net.Conn]string
 }
@@ -147,11 +153,20 @@ Uptime: {{.Uptime}}
 </ul>
 
 <h2>Replies Observed</h2>
-<ul>
+<table>
+	<tr>
+		<th>From</th>
+		<th>When</th>
+		<th>Text</th>
+	</tr>
 	{{range $reply, $_ := .Replies}}
-	<li>{{$reply}}</li>
+	<tr>
+		<td>{{$reply.FromPeer}}</td>
+		<td>{{$reply.TimeSeen}}</td>
+		<td>{{$reply.Text}}</td>
+	</tr>
 	{{end}}
-</ul>
+</table>
 
 </body></html>`)
 	if err != nil {
@@ -159,7 +174,7 @@ Uptime: {{.Uptime}}
 	}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p := templateParams{
-			Replies: secrets,
+			Replies: repliesSeen,
 			Uptime:  time.Now().Sub(startTime).String(),
 			Peers:   conn2peer,
 		}
@@ -490,11 +505,16 @@ func processReply(c net.Conn, msg *Message) {
 
 	logMsg := fmt.Sprintf("Address %v:%v sent secret text \"%v\" (size %v)\n", net.IP(ipBytes).String(), port, secretText, len(msg.Payload)-6)
 
-	if _, ok := secrets[logMsg]; ok {
+	rep := CapturedReply{
+		FromPeer: fmt.Sprintf("%v:%v", net.IP(ipBytes).String(), port),
+		TimeSeen: time.Now(),
+		Text:     secretText}
+
+	if _, ok := repliesSeen[rep]; ok {
 		return
 	}
 
-	secrets[logMsg] = true
+	repliesSeen[rep] = true
 
 	log.Print(logMsg)
 	file, err := os.OpenFile(logFile, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0666)
