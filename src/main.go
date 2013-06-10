@@ -252,6 +252,10 @@ func send(c net.Conn, msg *Message) {
 		log.Println("SEND", msg)
 	}
 
+	if _, ok := conn2peer[c]; !ok {
+		return
+	}
+
 	b, err := msg.Bytes()
 	if err != nil {
 		log.Println("Err converting msg to bytes: ", err)
@@ -261,6 +265,7 @@ func send(c net.Conn, msg *Message) {
 	n, err := c.Write(b)
 	if n != len(b) || err != nil {
 		log.Println("Err writing to conn: ", err)
+		killConnection(c)
 		return
 	}
 }
@@ -289,6 +294,8 @@ type Message struct {
 func handleConnection(c net.Conn) {
 	peer := c.RemoteAddr().String()
 	conn2peer[c] = peer
+
+	fmt.Println("Connected to ", peer)
 
 	if _, ok := peer2conn[peer]; ok {
 		peer2conn[peer] = c
@@ -346,8 +353,12 @@ func handleConnection(c net.Conn) {
 	}
 
 	log.Println("Read err:", err)
+	killConnection(c)
+}
+
+func killConnection(c net.Conn) {
 	log.Println("Closing conn:", c.RemoteAddr())
-	peer = conn2peer[c]
+	peer := conn2peer[c]
 	if _, ok := peer2conn[peer]; ok {
 		peer2conn[peer] = nil
 	}
@@ -477,7 +488,7 @@ func processReply(c net.Conn, msg *Message) {
 		}
 	}
 
-	logMsg := fmt.Sprintf("Address %v:%v sent secret text \"%v\"\n", net.IP(ipBytes).String(), port, secretText)
+	logMsg := fmt.Sprintf("Address %v:%v sent secret text \"%v\" (size %v)\n", net.IP(ipBytes).String(), port, secretText, len(msg.Payload)-6)
 
 	if _, ok := secrets[logMsg]; ok {
 		return
